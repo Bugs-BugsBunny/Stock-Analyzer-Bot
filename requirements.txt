@@ -1,6 +1,7 @@
 python-telegram-bot
-google-genai 3
+google-genai
 pandas
 psycopg2-binary
 matplotlib
+
 
