@@ -1,4 +1,3 @@
-import os
 import io
 import time
 import logging
@@ -7,56 +6,147 @@ import psycopg2
 import matplotlib.pyplot as plt
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from openai import OpenAI
+from google import genai # Клиент Gemini
+import os
 
 # -----------------------------------------------------------
 # 1. ТОКЕНЫ И НАСТРОЙКИ (Считываем из переменных среды)
 # -----------------------------------------------------------
 # Render автоматически предоставит эти значения
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+# Ключ Gemini будет считываться из GEMINI_API_KEY
+# OPENAI_API_KEY теперь не используется
 
-DB_NAME = "telegram_bot_db"
-DB_USER = "postgres"
+# Данные для подключения к PostgreSQL (берем ИСКЛЮЧИТЕЛЬНО из переменных среды Render)
+# ВАЖНО: Эти переменные нужно будет добавить в настройки Environment на Render!
+DB_NAME = os.environ.get("DB_NAME") # Должно быть установлено на Render
+DB_USER = os.environ.get("DB_USER") # Должно быть установлено на Render
 DB_PASSWORD = os.environ.get("DB_PASSWORD")
-DB_HOST = "localhost"
+DB_HOST = os.environ.get("DB_HOST") # Полный адрес хоста (например, dpg-xxxx.render.com)
 # -----------------------------------------------------------
 
 # Настройка логирования
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# Инициализация клиента OpenAI
-client = OpenAI(api_key=OPENAI_API_KEY)
+# --- Инициализация клиента Gemini (Глобально) ---
+# Ключ будет взят из переменной среды GEMINI_API_KEY
+try:
+    gemini_client = genai.Client()
+    logging.info("Клиент Gemini успешно инициализирован.")
+except Exception as e:
+    logging.error(f"Ошибка инициализации клиента Gemini: {e}")
+    # Если ключ не найден, это будет обрабатываться в функции generate_sql_query
 
+# --- Вспомогательная функция для выполнения SQL-запроса ---
 
-# --- Вспомогательные функции для работы с БД ---
-
-def execute_db_query(query: str, fetch_results=True):
-    """Выполняет SQL-запрос и возвращает данные, если необходимо."""
+def execute_db_query(sql_query: str) -> pd.DataFrame | None:
+    """Выполняет SQL-запрос и возвращает данные в DataFrame."""
     conn = None
+    df = None
+    
+    # Дополнительная проверка на наличие всех переменных БД
+    if not all([DB_NAME, DB_USER, DB_PASSWORD, DB_HOST]):
+        logging.error("Отсутствуют необходимые переменные среды для подключения к БД.")
+        return None
+
     try:
-        conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST)
-        cursor = conn.cursor()
-        cursor.execute(query)
+        conn = psycopg2.connect(
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST,
+        )
+        # Установите имя курсора для отладки
+        conn.cursor().execute("SET application_name = 'telegram_bot_app'")
+        df = pd.read_sql(sql_query, conn)
+        logging.info(f"Успешно выполнено: {sql_query}")
+        return df
 
-        if fetch_results:
-            # Извлекаем данные и имена колонок
-            data = cursor.fetchall()
-            columns = [desc[0] for desc in cursor.description]
-            return pd.DataFrame(data, columns=columns)
-        else:
-            # Для INSERT/UPDATE/CREATE
-            conn.commit()
-            return None
-
-    except Exception as e:
-        logging.error(f"Ошибка выполнения SQL: {e}")
-        # Возвращаем пустой DataFrame, чтобы избежать сбоя
-        return pd.DataFrame() if fetch_results else None
+    except psycopg2.Error as e:
+        # Критическая ошибка подключения или выполнения SQL
+        logging.error(f"КРИТИЧЕСКАЯ ОШИБКА БД: {e}")
+        return None
     finally:
         if conn:
             conn.close()
 
+
+# --- Функции, использующие Gemini (заменили OpenAI) ---
+
+def generate_sql_query(user_request: str) -> str:
+    """Генерирует SQL-запрос на основе текстового промпта, используя Gemini API."""
+    try:
+        # Проверяем, что клиент инициализирован
+        if 'gemini_client' not in globals():
+            return "ОШИБКА: Клиент Gemini не инициализирован. Проверьте GEMINI_API_KEY."
+
+        # Описание структуры БД для модели
+        db_schema = (
+            "У тебя есть таблица 'stock_data' с колонками: date (TEXT, YYYY-MM-DD), ticker (TEXT), "
+            "brand_name (TEXT), close (REAL), industry_tag (TEXT), year_extracted (INTEGER). "
+            "Все данные за 2024 год."
+        )
+
+        # Полный промпт
+        full_prompt = (
+            f"Вы эксперт по SQL для PostgreSQL. Ваша задача - преобразовать запрос пользователя "
+            f"('{user_request}') в ОДИН корректный SQL-запрос. "
+            f"Используй ТОЛЬКО таблицу 'stock_data'. Генерируй ТОЛЬКО чистый SQL-запрос, "
+            f"не добавляй объяснений, знаков препинания или кавычек.\n"
+            f"1. Запрос должен ВСЕГДА выбирать колонки **date** и **close**.\n"
+            f"2. Фильтруйте по 'brand_name' (ИЛИ 'ticker', если указан) и по 'date' (используйте BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD').\n"
+            f"3. **ОБЯЗАТЕЛЬНО** сортируйте результат по date (ASC).\n"
+            f"СТРУКТУРА БД: {db_schema}"
+        )
+
+        # Вызов модели Gemini
+        response = gemini_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=full_prompt
+        )
+
+        sql_query = response.text.strip()
+
+        # Удаляем форматирование, если модель его добавила
+        if sql_query.lower().startswith('```sql'):
+            sql_query = sql_query[7:-3].strip()
+        
+        logging.info(f"Сгенерированный SQL (Gemini): {sql_query}")
+        return sql_query
+
+    except Exception as e:
+        logging.error(f"ОШИБКА генерации SQL через Gemini: {e}")
+        return f"ОШИБКА: Не удалось сгенерировать SQL-запрос. Проверьте ваш API-ключ Gemini."
+
+
+def generate_analysis_text(user_request: str, df_data: pd.DataFrame, stats: dict) -> str:
+    """Использует Gemini для генерации аналитического разбора."""
+
+    # Форматируем статистику для промпта
+    stats_str = "\n".join([f"- {k}: {v:.2f}" for k, v in stats.items()])
+
+    prompt = (
+        f"Пользователь запросил анализ данных: '{user_request}'.\n"
+        "Предоставлены следующие статистические данные:\n"
+        f"{stats_str}\n"
+        "Начальная цена: {:.2f}, Конечная цена: {:.2f}.\n"
+        "Напишите краткий аналитический разбор (не более 4-5 предложений) для ответа боту.\n"
+        "Сфокусируйтесь на росте/падении, общей волатильности и основных выводах за период. НЕ упоминайте SQL или БД."
+        .format(df_data['close'].iloc[0], df_data['close'].iloc[-1])
+    )
+
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash", 
+            contents=prompt,
+            # Дополнительные настройки для творческого текста
+            config={"temperature": 0.5} 
+        )
+        return response.text.strip()
+    
+    except Exception as e:
+        logging.error(f"ОШИБКА генерации аналитики через Gemini: {e}")
+        return "❌ Ошибка: Не удалось сгенерировать аналитический текст. Проверьте ваш API-ключ Gemini."
 
 # --- Обработчики команд Telegram ---
 
@@ -82,7 +172,7 @@ async def analyze_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await update.message.reply_text("🔎 Анализирую ваш запрос... Пожалуйста, подождите.")
 
-    # 2. Запрос к OpenAI для генерации SQL-запроса
+    # 2. Запрос к Gemini для генерации SQL-запроса
     try:
         sql_query = generate_sql_query(user_request)
     except Exception as e:
@@ -95,16 +185,25 @@ async def analyze_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     df_data = execute_db_query(sql_query)
 
     if df_data is None or df_data.empty:
-        await update.message.reply_text(
-            "⚠️ По вашему запросу не найдено данных или произошла ошибка в БД.\n"
-            "Убедитесь, что вы запрашиваете акции технологических компаний за 2024 год, используя тикер (MSFT) или название (Microsoft)."
-        )
+        # Проверяем на ошибку API Gemini (если функция вернула строку с ошибкой)
+        if sql_query.startswith("ОШИБКА:"):
+            await update.message.reply_text(sql_query)
+        else:
+            await update.message.reply_text(
+                "⚠️ По вашему запросу не найдено данных или произошла ошибка в БД.\n"
+                "Убедитесь, что вы запрашиваете акции технологических компаний за 2024 год, используя тикер (MSFT) или название (Microsoft)."
+            )
         return
 
     # 4. Генерация статистики, графика и аналитики
     await update.message.reply_text("📈 Данные получены. Готовлю аналитику и график...")
 
-    # Расчет базовой статистики (если данные есть)
+    # Преобразование даты в datetime, если это не сделано
+    if 'date' in df_data.columns:
+        df_data['date'] = pd.to_datetime(df_data['date'])
+        df_data = df_data.sort_values(by='date') # Сортировка данных по дате
+
+    # Расчет базовой статистики
     if 'close' not in df_data.columns or df_data.empty:
         await update.message.reply_text("⚠️ Ошибка: В полученных данных нет колонки 'close' для анализа.")
         return
@@ -119,65 +218,12 @@ async def analyze_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Генерация графика
     photo_file = generate_chart(df_data, user_request)
 
-    # Генерация аналитического текста через OpenAI
+    # Генерация аналитического текста через Gemini
     analysis_text = generate_analysis_text(user_request, df_data, stats)
 
     # 5. Отправка результатов
     await context.bot.send_photo(chat_id=chat_id, photo=photo_file)
     await update.message.reply_text(analysis_text)
-
-
-# --- Функции, использующие OpenAI ---
-
-def generate_sql_query(user_request: str) -> str:
-    """Использует OpenAI для преобразования запроса в SQL-запрос."""
-    # ОЧЕНЬ ВАЖНО: Подробный промпт для LLM!
-    prompt = (
-        "Вы эксперт по SQL для PostgreSQL. Ваша задача - преобразовать запрос пользователя "
-        f"('{user_request}') в ОДИН корректный SQL-запрос.\n"
-        "База данных: 'telegram_bot_db'. Таблица: 'stock_data'.\n"
-        "Колонки таблицы (ВАЖНО): date (TIMESTAMP), close (DECIMAL), brand_name (VARCHAR), ticker (VARCHAR), open (DECIMAL), high (DECIMAL), low (DECIMAL), volume (BIGINT), industry_tag (VARCHAR), country (VARCHAR), dividends (DECIMAL), stock splits (DECIMAL), capital gains (DECIMAL).\n"
-        "1. Запрос должен ВСЕГДА выбирать колонки **date** и **close**.\n"
-        "2. Фильтруйте по 'brand_name' (ИЛИ 'ticker', если указан) и по 'date' (используйте BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD').\n"
-        "3. **ОБЯЗАТЕЛЬНО** сортируйте результат по date (ASC).\n"
-        "4. **ОБЯЗАТЕЛЬНО** верните ТОЛЬКО чистый SQL-запрос без объяснений, знаков препинания или кавычек.\n"
-        "ПРИМЕР: 'SELECT date, close FROM stock_data WHERE brand_name = 'Apple Inc.' AND date BETWEEN '2024-03-01' AND '2024-03-31' ORDER BY date ASC;'"
-    )
-
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.0  # Низкая температура для предсказуемости
-    )
-
-    sql_text = response.choices[0].message.content.strip()
-    logging.info(f"Сгенерированный SQL: {sql_text}")
-    return sql_text
-
-
-def generate_analysis_text(user_request: str, df_data: pd.DataFrame, stats: dict) -> str:
-    """Использует OpenAI для генерации аналитического разбора."""
-
-    # Форматируем статистику для промпта
-    stats_str = "\n".join([f"- {k}: {v:.2f}" for k, v in stats.items()])
-
-    prompt = (
-        f"Пользователь запросил анализ данных: '{user_request}'.\n"
-        "Предоставлены следующие статистические данные:\n"
-        f"{stats_str}\n"
-        "Начальная цена: {:.2f}, Конечная цена: {:.2f}.\n"
-        "Напишите краткий аналитический разбор (не более 4-5 предложений) для ответа боту.\n"
-        "Сфокусируйтесь на росте/падении, общей волатильности и основных выводах за период. НЕ упоминайте SQL или БД."
-        .format(df_data['close'].iloc[0], df_data['close'].iloc[-1])
-    )
-
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.5  # Средняя температура для творческого анализа
-    )
-
-    return response.choices[0].message.content.strip()
 
 
 # --- Функция для генерации графика ---
@@ -226,12 +272,13 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, analyze_message))
 
-    # Запуск бота (будет работать до тех пор, пока вы его не остановите)
+    # Запуск бота
     print("Бот запущен. Откройте Telegram и начните диалог.")
     application.run_polling(poll_interval=1.0)
 
 
 if __name__ == '__main__':
-    # Установка API-ключа OpenAI в переменную среды (для безопасности)
-    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+    # На Render переменные среды уже установлены.
+    # На локальной машине этот код запускается напрямую
+    # Для целей Render этот блок можно упростить:
     main()
