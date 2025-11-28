@@ -1,7 +1,5 @@
-python-telegram-bot
+python-telegram-bot[webhooks]
 google-genai
-pandas
-psycopg2-binary
-matplotlib
+
 
 
