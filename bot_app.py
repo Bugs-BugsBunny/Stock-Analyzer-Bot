@@ -113,10 +113,29 @@ def main() -> None:
     
     # Регистрация глобального обработчика ошибок
     application.add_error_handler(error_handler)
-
-    # Запуск бота
-    print("Бот запущен. Откройте Telegram и начните диалог.")
-    application.run_polling(poll_interval=1.0)
+    
+    # -----------------------------------------------------------
+    # Запуск бота (Polling vs. Webhook)
+    # -----------------------------------------------------------
+    # Порт для Webhook (используем тот, который предоставляет Render)
+    PORT = int(os.environ.get('PORT', 8080))
+    
+    if 'RENDER_EXTERNAL_URL' in os.environ:
+        # Режим Webhook для Render
+        url = os.environ['RENDER_EXTERNAL_URL']
+        print(f"Бот запущен в режиме Webhook. URL: {url}, Порт: {PORT}")
+        
+        # Запуск Webhook
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=TELEGRAM_TOKEN, # Путь должен соответствовать токену (стандартная практика)
+            webhook_url=f"{url}/{TELEGRAM_TOKEN}"
+        )
+    else:
+        # Режим Polling для локального запуска
+        print("Бот запущен в режиме Polling. Откройте Telegram и начните диалог.")
+        application.run_polling(poll_interval=1.0)
 
 
 if __name__ == '__main__':
