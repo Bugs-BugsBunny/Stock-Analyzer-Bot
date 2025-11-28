@@ -1,5 +1,6 @@
 python-telegram-bot[webhooks]
 google-genai
-
+SQLAlchemy
+psycopg2-binary
 
 
