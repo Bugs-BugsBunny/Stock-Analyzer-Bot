@@ -9,7 +9,7 @@ from telegram.ext import (
     ContextTypes
 )
 from google import genai
-from google.genai import types # <-- Импорт для GenerateContentConfig
+from google.genai import types # <-- КРИТИЧЕСКИ ВАЖНЫЙ ИМПОРТ ДЛЯ КОНФИГУРАЦИИ
 from google.genai.errors import APIError
 
 # --- Настройка логирования ---
@@ -41,28 +41,26 @@ try:
     logger.info("Gemini Client успешно инициализирован.")
 except Exception as e:
     logger.error(f"Ошибка инициализации Gemini клиента: {e}")
-    GENAI_CLIENT = None # Устанавливаем в None на случай ошибки
+    GENAI_CLIENT = None
 
 # --- Вспомогательная функция для управления контекстом ---
 def get_chat_session(chat_id: int):
     """
     Создает новую сессию чата Gemini с системной инструкцией.
-    Сессия чата нужна для сохранения истории сообщений.
     """
     if not GENAI_CLIENT:
         return None
 
-    # 1. Создание объекта конфигурации для системной инструкции
-    # ЭТО ИСПРАВЛЕНИЕ ОШИБКИ: 'system_instruction' должен быть внутри config
+    # 1. Создание объекта конфигурации для системной инструкции (ИСПРАВЛЕНИЕ ОШИБКИ)
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT
     )
     
     try:
-        # 2. Создание чата с передачей конфигурации
+        # 2. Создание чата с передачей конфигурации (ИСПРАВЛЕНИЕ ОШИБКИ)
         chat = GENAI_CLIENT.chats.create(
             model=GEMINI_MODEL,
-            config=config # <-- Правильный аргумент
+            config=config # <-- Правильный аргумент для передачи system_instruction
         )
         logger.info(f"Сессия Gemini Chat для {chat_id} успешно создана.")
         return chat
@@ -75,10 +73,10 @@ def get_chat_session(chat_id: int):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Отправляет приветственное сообщение и очищает/сбрасывает контекст чата.
+    Отправляет приветственное сообщение и сбрасывает контекст чата.
     """
     await update.message.reply_text(
-        '🤖 Привет! Я бот, работающий на Gemini. Отправь мне любое сообщение, и я постараюсь ответить!'
+        '🤖 Привет! Я бот, работающий на Gemini. Отправь мне любое сообщение, и я постараюсь ответить! Контекст сброшен.'
     )
     # Сбрасываем контекст при старте новой сессии
     if 'gemini_chat' in context.chat_data:
@@ -96,7 +94,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 1. Получение или создание сессии чата
     if 'gemini_chat' not in context.chat_data:
-        # Сессия будет храниться в 'context.chat_data' до перезапуска бота
         context.chat_data['gemini_chat'] = get_chat_session(chat_id)
 
     chat_session = context.chat_data['gemini_chat']
@@ -137,7 +134,6 @@ def main():
     logger.info("Начало настройки Application...")
     
     # Создаем Application
-    # persistence=Application.DEFAULT_PERSISTENCE, # Можно добавить для сохранения контекста между перезапусками
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Добавляем обработчики
@@ -150,9 +146,7 @@ def main():
         application.run_webhook(
             listen="0.0.0.0",
             port=PORT,
-            # Путь для вебхука
             url_path=TELEGRAM_BOT_TOKEN, 
-            # Полный URL, который Telegram будет использовать
             webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_BOT_TOKEN}"
         )
         logger.info(f"✅ Бот запущен в режиме Webhooks на {WEBHOOK_URL}:{PORT}")
